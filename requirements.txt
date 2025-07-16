@@ -1,0 +1,7 @@
+streamlit>=1.32
+folium>=0.15
+pandas>=1.5
+plotly>=5.18
+numpy>=1.23
+requests>=2.31
+python-dotenv>=1.0       # lets the script read .env if you use that method

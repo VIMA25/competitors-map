@@ -1,0 +1,974 @@
+import pandas as pd
+import folium
+from folium import plugins
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+import json
+from datetime import datetime
+import requests
+from typing import Optional, Dict, Any
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration
+MAPBOX_TOKEN = "pk.eyJ1IjoianVhbnY5NSIsImEiOiJjbWN5Z3I5dHUwbjg1MmpzYW1nY3JjM3hoIn0.HHuDkkuSh3iIXCurZ5DGPg"
+DEFAULT_CENTER = [27.7663, -82.6404]  # Florida center
+DEFAULT_ZOOM = 7
+
+# Enhanced styling constants
+COLORS = {
+    'primary': '#4facfe',
+    'secondary': '#00f2fe',
+    'success': '#28a745',
+    'warning': '#ffc107',
+    'danger': '#dc3545',
+    'info': '#17a2b8',
+    'light': '#f8f9fa',
+    'dark': '#343a40'
+}
+
+TYPE_COLORS = {
+    'Lab': '#e74c3c',
+    'Satellite': '#3498db',
+    'Clinical Laboratory': '#f39c12',
+    'IVF Center': '#9b59b6',
+    'Fertility Clinic': '#2ecc71'
+}
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_data() -> pd.DataFrame:
+    """Load and process the fertility clinic data with enhanced error handling"""
+    try:
+        # Try to read the CSV file
+        df = pd.read_csv('Competitors SART-CDC-AHCA.csv')
+        logger.info(f"Successfully loaded {len(df)} records from CSV")
+        
+        # Data cleaning and validation
+        df = clean_and_validate_data(df)
+        
+        return df
+    except FileNotFoundError:
+        st.error("CSV file 'Competitors SART-CDC-AHCA.csv' not found. Please ensure the file is in the correct location.")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        logger.error(f"Error loading data: {str(e)}")
+        return pd.DataFrame()
+
+def clean_and_validate_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean and validate the dataset with comprehensive error handling"""
+    try:
+        # Create a copy to avoid modifying original data
+        df = df.copy()
+        
+        # Coordinate validation and cleaning
+        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+        
+        # Remove invalid coordinates (outside reasonable bounds for Florida)
+        df = df[
+            (df['Latitude'].between(24.0, 31.0)) & 
+            (df['Longitude'].between(-87.0, -80.0)) |
+            df['Latitude'].isna() | df['Longitude'].isna()
+        ]
+        
+        # Numeric columns processing
+        numeric_columns = ['Total Cycles 2022', 'Pregnancies 2022', 'Deliveries 2022']
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                # Set negative values to NaN
+                df[col] = df[col].where(df[col] >= 0)
+        
+        # Success rate processing with validation
+        if 'Success Rate' in df.columns:
+            df['Success Rate Numeric'] = df['Success Rate'].astype(str).str.replace('%', '').replace('Not Reported Yet', np.nan)
+            df['Success Rate Numeric'] = pd.to_numeric(df['Success Rate Numeric'], errors='coerce')
+            # Validate success rate is between 0 and 100
+            df['Success Rate Numeric'] = df['Success Rate Numeric'].where(
+                df['Success Rate Numeric'].between(0, 100)
+            )
+        
+        # Boolean columns with enhanced mapping
+        boolean_mappings = {
+            'In_CDC': {'TRUE': True, 'FALSE': False, 'Yes': True, 'No': False, True: True, False: False},
+            'In service area': {'Yes': True, 'No': False, 'TRUE': True, 'FALSE': False, True: True, False: False}
+        }
+        
+        for col, mapping in boolean_mappings.items():
+            if col in df.columns:
+                df[col] = df[col].map(mapping)
+        
+        # Data quality metrics
+        total_records = len(df)
+        valid_coords = df.dropna(subset=['Latitude', 'Longitude']).shape[0]
+        logger.info(f"Data quality: {valid_coords}/{total_records} records have valid coordinates")
+        
+        # Add calculated fields
+        df['Success Rate Category'] = pd.cut(
+            df['Success Rate Numeric'], 
+            bins=[0, 30, 50, 70, 100], 
+            labels=['Low', 'Medium', 'High', 'Very High'],
+            include_lowest=True
+        )
+        
+        # Add cycle volume category
+        df['Cycle Volume Category'] = pd.cut(
+            df['Total Cycles 2022'], 
+            bins=[0, 50, 200, 500, float('inf')], 
+            labels=['Small', 'Medium', 'Large', 'Very Large'],
+            include_lowest=True
+        )
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error in data cleaning: {str(e)}")
+        st.error(f"Error processing data: {str(e)}")
+        return df
+
+def create_enhanced_folium_map(df_filtered: pd.DataFrame, mapbox_token: str = None) -> folium.Map:
+    """Create an enhanced interactive Folium map with improved features"""
+    
+    # Calculate map center with fallback
+    if not df_filtered.empty and not df_filtered[['Latitude', 'Longitude']].isna().all().all():
+        center_lat = df_filtered['Latitude'].median()
+        center_lon = df_filtered['Longitude'].median()
+    else:
+        center_lat, center_lon = DEFAULT_CENTER
+    
+    # Create base map with improved styling
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=DEFAULT_ZOOM,
+        tiles=None,
+        prefer_canvas=True
+    )
+    
+    # Add tile layers with error handling
+    try:
+        if mapbox_token:
+            # Mapbox Streets
+            folium.TileLayer(
+                tiles=f'https://api.mapbox.com/styles/v1/mapbox/streets-v11/tiles/{{z}}/{{x}}/{{y}}?access_token={mapbox_token}',
+                attr='Mapbox',
+                name='Streets',
+                overlay=False,
+                control=True
+            ).add_to(m)
+            
+            # Mapbox Satellite
+            folium.TileLayer(
+                tiles=f'https://api.mapbox.com/styles/v1/mapbox/satellite-v9/tiles/{{z}}/{{x}}/{{y}}?access_token={mapbox_token}',
+                attr='Mapbox',
+                name='Satellite',
+                overlay=False,
+                control=True
+            ).add_to(m)
+        else:
+            # Fallback to free tiles
+            folium.TileLayer(
+                tiles='OpenStreetMap',
+                name='OpenStreetMap',
+                overlay=False,
+                control=True
+            ).add_to(m)
+    except Exception as e:
+        logger.warning(f"Error adding tile layers: {str(e)}")
+    
+    # Add fallback tile layer
+    folium.TileLayer(
+        tiles='OpenStreetMap',
+        name='OpenStreetMap',
+        overlay=False,
+        control=True
+    ).add_to(m)
+    
+    # Create marker clusters for better performance
+    marker_cluster = plugins.MarkerCluster(
+        name='Clinics',
+        overlay=True,
+        control=True,
+        icon_create_function="""
+        function(cluster) {
+            return L.divIcon({
+                html: '<div style="background-color: #4facfe; color: white; border-radius: 50%; width: 40px; height: 40px; display: flex; justify-content: center; align-items: center; font-weight: bold; border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">' + cluster.getChildCount() + '</div>',
+                className: 'marker-cluster',
+                iconSize: [40, 40]
+            });
+        }
+        """
+    ).add_to(m)
+    
+    # Add individual markers
+    for idx, row in df_filtered.iterrows():
+        if pd.notna(row['Latitude']) and pd.notna(row['Longitude']):
+            add_clinic_marker(marker_cluster, row)
+    
+    # Add heat map layer for clinic density
+    if len(df_filtered) > 1:
+        heat_data = []
+        for idx, row in df_filtered.iterrows():
+            if pd.notna(row['Latitude']) and pd.notna(row['Longitude']):
+                # Weight by total cycles if available
+                weight = row.get('Total Cycles 2022', 1) if pd.notna(row.get('Total Cycles 2022')) else 1
+                heat_data.append([row['Latitude'], row['Longitude'], weight])
+        
+        if heat_data:
+            plugins.HeatMap(
+                heat_data,
+                name='Clinic Density',
+                overlay=True,
+                control=True,
+                radius=15,
+                blur=10
+            ).add_to(m)
+    
+    # Add layer control
+    folium.LayerControl().add_to(m)
+    
+    # Add fullscreen button
+    plugins.Fullscreen().add_to(m)
+    
+    # Add measure control
+    plugins.MeasureControl().add_to(m)
+    
+    return m
+
+def add_clinic_marker(marker_cluster: plugins.MarkerCluster, row: pd.Series) -> None:
+    """Add a single clinic marker with enhanced popup"""
+    
+    # Determine marker styling
+    in_service = row.get('In service area', False)
+    clinic_type = row.get('Type', 'Unknown')
+    
+    # Color coding
+    if in_service:
+        color = COLORS['success']
+    else:
+        color = COLORS['light']
+    
+    border_color = TYPE_COLORS.get(clinic_type, COLORS['dark'])
+    
+    # Create enhanced popup
+    popup_html = create_popup_html(row)
+    
+    # Create marker with custom icon
+    icon_html = f'''
+    <div style="
+        width: 20px; 
+        height: 20px; 
+        border-radius: 50%; 
+        background-color: {color}; 
+        border: 3px solid {border_color}; 
+        display: flex; 
+        align-items: center; 
+        justify-content: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    ">
+        <div style="
+            width: 8px; 
+            height: 8px; 
+            background-color: white; 
+            border-radius: 50%;
+        "></div>
+    </div>
+    '''
+    
+    marker = folium.Marker(
+        location=[row['Latitude'], row['Longitude']],
+        popup=folium.Popup(popup_html, max_width=400),
+        icon=folium.DivIcon(
+            html=icon_html,
+            icon_size=(20, 20),
+            icon_anchor=(10, 10)
+        )
+    )
+    
+    marker.add_to(marker_cluster)
+
+def create_popup_html(row: pd.Series) -> str:
+    """Create enhanced HTML popup content for clinic markers"""
+    
+    # Helper function to format values
+    def format_value(value, default="Not Reported"):
+        if pd.isna(value):
+            return default
+        if isinstance(value, (int, float)):
+            return f"{value:,}" if value == int(value) else f"{value:.1f}"
+        return str(value)
+    
+    # Success rate styling
+    success_rate = row.get('Success Rate Numeric')
+    if pd.notna(success_rate):
+        if success_rate >= 70:
+            success_color = COLORS['success']
+        elif success_rate >= 50:
+            success_color = COLORS['warning']
+        else:
+            success_color = COLORS['danger']
+        success_style = f"background: {success_color}; color: white; padding: 4px 8px; border-radius: 12px; font-weight: bold;"
+    else:
+        success_style = "color: #6c757d; font-style: italic;"
+    
+    return f"""
+    <div style="width: 350px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.4;">
+        <div style="background: linear-gradient(135deg, {COLORS['primary']} 0%, {COLORS['secondary']} 100%); 
+                   color: white; padding: 20px; margin: -10px -10px 15px -10px; 
+                   border-radius: 12px 12px 0 0; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h3 style="margin: 0 0 8px 0; font-size: 18px; font-weight: 600;">{row.get('Clinic Name', 'Unknown Clinic')}</h3>
+            <p style="margin: 0; font-size: 14px; opacity: 0.9;">📍 {row.get('City', 'Unknown City')}, {row.get('State', 'FL')}</p>
+            <p style="margin: 5px 0 0 0; font-size: 12px; opacity: 0.8;">🏥 {row.get('Type', 'Unknown Type')}</p>
+        </div>
+        
+        <div style="padding: 0 10px;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <div style="text-align: center; padding: 10px; background: #f8f9fa; border-radius: 8px;">
+                    <div style="font-size: 20px; font-weight: bold; color: {COLORS['primary']};">{format_value(row.get('Total Cycles 2022'))}</div>
+                    <div style="font-size: 12px; color: #6c757d; margin-top: 4px;">Total Cycles 2022</div>
+                </div>
+                <div style="text-align: center; padding: 10px; background: #f8f9fa; border-radius: 8px;">
+                    <div style="font-size: 20px; font-weight: bold; color: {COLORS['success']};">{format_value(row.get('Deliveries 2022'))}</div>
+                    <div style="font-size: 12px; color: #6c757d; margin-top: 4px;">Deliveries 2022</div>
+                </div>
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #e9ecef;">
+                    <span style="font-weight: 600; color: #495057;">Success Rate:</span>
+                    <span style="{success_style}">{row.get('Success Rate', 'Not Reported')}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #e9ecef;">
+                    <span style="font-weight: 600; color: #495057;">Pregnancies 2022:</span>
+                    <span style="color: #6c757d; font-weight: 500;">{format_value(row.get('Pregnancies 2022'))}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #e9ecef;">
+                    <span style="font-weight: 600; color: #495057;">CDC Reporting:</span>
+                    <span style="color: {'#28a745' if row.get('In_CDC') else '#dc3545'}; font-weight: 500;">
+                        {'✓ Yes' if row.get('In_CDC') else '✗ No'}
+                    </span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0;">
+                    <span style="font-weight: 600; color: #495057;">Service Area:</span>
+                    <span style="color: {'#28a745' if row.get('In service area') else '#6c757d'}; font-weight: 500;">
+                        {'✓ In Area' if row.get('In service area') else '○ Outside Area'}
+                    </span>
+                </div>
+            </div>
+            
+            <div style="font-size: 12px; color: #6c757d; text-align: center; padding-top: 10px; border-top: 1px solid #e9ecef;">
+                📧 {row.get('Address', 'Address not available')}<br>
+                📞 {row.get('Phone', 'Phone not available')} | 🌐 {row.get('Website', 'Website not available')}
+            </div>
+        </div>
+    </div>
+    """
+
+def create_advanced_analytics(df_filtered: pd.DataFrame) -> None:
+    """Create advanced analytics visualizations"""
+    
+    st.subheader("📊 Advanced Analytics")
+    
+    # Performance metrics overview
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_cycles = df_filtered['Total Cycles 2022'].sum()
+        st.metric("Total Cycles", f"{total_cycles:,}" if pd.notna(total_cycles) else "N/A")
+    
+    with col2:
+        total_deliveries = df_filtered['Deliveries 2022'].sum()
+        st.metric("Total Deliveries", f"{total_deliveries:,}" if pd.notna(total_deliveries) else "N/A")
+    
+    with col3:
+        avg_success_rate = df_filtered['Success Rate Numeric'].mean()
+        st.metric("Avg Success Rate", f"{avg_success_rate:.1f}%" if pd.notna(avg_success_rate) else "N/A")
+    
+    with col4:
+        service_area_pct = (df_filtered['In service area'].sum() / len(df_filtered)) * 100
+        st.metric("In Service Area", f"{service_area_pct:.1f}%")
+    
+    # Advanced visualizations
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Success rate vs cycle volume
+        scatter_data = df_filtered.dropna(subset=['Total Cycles 2022', 'Success Rate Numeric'])
+        if not scatter_data.empty:
+            fig = px.scatter(
+                scatter_data,
+                x='Total Cycles 2022',
+                y='Success Rate Numeric',
+                size='Deliveries 2022',
+                color='Type',
+                hover_data=['Clinic Name', 'City'],
+                title='Success Rate vs Cycle Volume',
+                labels={'Total Cycles 2022': 'Total Cycles', 'Success Rate Numeric': 'Success Rate (%)'}
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        # Success rate distribution by category
+        if 'Success Rate Category' in df_filtered.columns:
+            category_counts = df_filtered['Success Rate Category'].value_counts()
+            if not category_counts.empty:
+                fig = px.bar(
+                    x=category_counts.index,
+                    y=category_counts.values,
+                    title='Success Rate Categories',
+                    labels={'x': 'Success Rate Category', 'y': 'Number of Clinics'},
+                    color=category_counts.values,
+                    color_continuous_scale='viridis'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+
+def create_streamlit_app():
+    """Create the main Streamlit application"""
+    
+    st.set_page_config(
+        page_title="🏥 Fertility Clinic Analytics Dashboard",
+        page_icon="🏥",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Enhanced CSS
+    st.markdown("""
+    <style>
+        /* Main styling */
+        .main-header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            padding: 2.5rem;
+            border-radius: 15px;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 30px rgba(79, 172, 254, 0.3);
+        }
+        .main-header h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 0.5rem;
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        .main-header p {
+            color: white;
+            text-align: center;
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+        
+        /* Metric cards */
+        .metric-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 1.5rem;
+            border-radius: 15px;
+            color: white;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+            transition: transform 0.3s ease;
+        }
+        .metric-card:hover {
+            transform: translateY(-5px);
+        }
+        .metric-card h3 {
+            margin: 0;
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        .metric-card p {
+            margin: 0.5rem 0 0 0;
+            opacity: 0.9;
+            font-size: 1rem;
+        }
+        
+        /* Sidebar styling */
+        .sidebar .sidebar-content {
+            background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
+        }
+        
+        /* Tab styling */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 2px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            height: 50px;
+            padding: 0 24px;
+            border-radius: 10px 10px 0 0;
+            background: linear-gradient(135deg, #e9ecef 0%, #f8f9fa 100%);
+        }
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+        }
+        
+        /* Alert styling */
+        .stAlert {
+            border-radius: 10px;
+            border: none;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🏥 Fertility Clinic Analytics Dashboard</h1>
+        <p>Comprehensive analysis of fertility clinics across Florida with interactive mapping and performance metrics</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Load data
+    df = load_data()
+    
+    if df.empty:
+        st.warning("No data available. Please check your data source.")
+        return
+    
+    # Sidebar filters
+    st.sidebar.header("🔍 Filters & Controls")
+    
+    # Enhanced filters
+    col1, col2 = st.sidebar.columns(2)
+    
+    with col1:
+        # Type filter
+        type_options = ['All'] + sorted(df['Type'].dropna().unique().tolist())
+        selected_type = st.selectbox("🏥 Clinic Type", type_options)
+    
+    with col2:
+        # CDC filter
+        cdc_options = ['All', 'Yes', 'No']
+        selected_cdc = st.selectbox("📊 CDC Reporting", cdc_options)
+    
+    # Service area and advanced filters
+    col3, col4 = st.sidebar.columns(2)
+    
+    with col3:
+        service_options = ['All', 'Yes', 'No']
+        selected_service = st.selectbox("📍 Service Area", service_options)
+    
+    with col4:
+        # Success rate filter
+        success_options = ['All', 'High (70%+)', 'Medium (50-70%)', 'Low (<50%)', 'Not Reported']
+        selected_success = st.selectbox("🎯 Success Rate", success_options)
+    
+    # Search functionality
+    search_term = st.sidebar.text_input("🔍 Search Clinic Name or City", placeholder="Enter search term...")
+    
+    # Advanced filters
+    with st.sidebar.expander("⚙️ Advanced Filters"):
+        # Cycle volume filter
+        if 'Total Cycles 2022' in df.columns:
+            cycle_range = st.slider(
+                "Total Cycles Range",
+                min_value=0,
+                max_value=int(df['Total Cycles 2022'].max()) if df['Total Cycles 2022'].max() > 0 else 1000,
+                value=(0, int(df['Total Cycles 2022'].max()) if df['Total Cycles 2022'].max() > 0 else 1000)
+            )
+        
+        # Success rate range
+        if 'Success Rate Numeric' in df.columns:
+            success_range = st.slider(
+                "Success Rate Range (%)",
+                min_value=0,
+                max_value=100,
+                value=(0, 100)
+            )
+    
+    # Apply filters
+    df_filtered = apply_filters(df, selected_type, selected_cdc, selected_service, 
+                               selected_success, search_term, locals().get('cycle_range'), 
+                               locals().get('success_range'))
+    
+    # Display metrics
+    display_metrics(df_filtered)
+    
+    # Create tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Interactive Map", "📊 Analytics", "📈 Performance", "📋 Data Explorer"])
+    
+    with tab1:
+        st.subheader("🗺️ Interactive Clinic Map")
+        
+        # Map controls
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            st.info(f"Displaying {len(df_filtered)} clinics on the map")
+        
+        with col2:
+            show_heatmap = st.checkbox("Show Density Heatmap", value=True)
+        
+        with col3:
+            show_clusters = st.checkbox("Cluster Markers", value=True)
+        
+        # Create and display map
+        if not df_filtered.empty:
+            try:
+                m = create_enhanced_folium_map(df_filtered, MAPBOX_TOKEN)
+                st.components.v1.html(m._repr_html_(), height=700)
+            except Exception as e:
+                st.error(f"Error creating map: {str(e)}")
+                logger.error(f"Map creation error: {str(e)}")
+        else:
+            st.warning("No clinics match the selected filters.")
+    
+    with tab2:
+        create_advanced_analytics(df_filtered)
+    
+    with tab3:
+        create_performance_analysis(df_filtered)
+    
+    with tab4:
+        create_data_explorer(df_filtered)
+
+def apply_filters(df: pd.DataFrame, selected_type: str, selected_cdc: str, 
+                 selected_service: str, selected_success: str, search_term: str,
+                 cycle_range: tuple = None, success_range: tuple = None) -> pd.DataFrame:
+    """Apply all filters to the dataframe"""
+    
+    df_filtered = df.copy()
+    
+    # Type filter
+    if selected_type != 'All':
+        df_filtered = df_filtered[df_filtered['Type'] == selected_type]
+    
+    # CDC filter
+    if selected_cdc != 'All':
+        df_filtered = df_filtered[df_filtered['In_CDC'] == (selected_cdc == 'Yes')]
+    
+    # Service area filter
+    if selected_service != 'All':
+        df_filtered = df_filtered[df_filtered['In service area'] == (selected_service == 'Yes')]
+    
+    # Success rate category filter
+    if selected_success != 'All':
+        if selected_success == 'High (70%+)':
+            df_filtered = df_filtered[df_filtered['Success Rate Numeric'] >= 70]
+        elif selected_success == 'Medium (50-70%)':
+            df_filtered = df_filtered[df_filtered['Success Rate Numeric'].between(50, 70)]
+        elif selected_success == 'Low (<50%)':
+            df_filtered = df_filtered[df_filtered['Success Rate Numeric'] < 50]
+        elif selected_success == 'Not Reported':
+            df_filtered = df_filtered[df_filtered['Success Rate Numeric'].isna()]
+    
+    # Search filter
+    if search_term:
+        mask = (
+            df_filtered['Clinic Name'].str.contains(search_term, case=False, na=False) |
+            df_filtered['City'].str.contains(search_term, case=False, na=False) |
+            df_filtered['Address'].str.contains(search_term, case=False, na=False)
+        )
+        df_filtered = df_filtered[mask]
+    
+    # Advanced filters
+    if cycle_range:
+        df_filtered = df_filtered[
+            df_filtered['Total Cycles 2022'].between(cycle_range[0], cycle_range[1]) |
+            df_filtered['Total Cycles 2022'].isna()
+        ]
+    
+    if success_range:
+        df_filtered = df_filtered[
+            df_filtered['Success Rate Numeric'].between(success_range[0], success_range[1]) |
+            df_filtered['Success Rate Numeric'].isna()
+        ]
+    
+    return df_filtered
+
+def display_metrics(df_filtered: pd.DataFrame) -> None:
+    """Display key metrics in an attractive layout"""
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_clinics = len(df_filtered)
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{total_clinics}</h3>
+            <p>Total Clinics</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        cdc_count = df_filtered['In_CDC'].sum() if 'In_CDC' in df_filtered.columns else 0
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{cdc_count}</h3>
+            <p>CDC Reporting</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        service_count = df_filtered['In service area'].sum() if 'In service area' in df_filtered.columns else 0
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{service_count}</h3>
+            <p>In Service Area</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        avg_success = df_filtered['Success Rate Numeric'].mean()
+        avg_success_str = f"{avg_success:.1f}%" if pd.notna(avg_success) else "N/A"
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{avg_success_str}</h3>
+            <p>Avg Success Rate</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+
+def create_performance_analysis(df_filtered: pd.DataFrame) -> None:
+    """Create detailed performance analysis visualizations"""
+    
+    st.subheader("📈 Performance Analysis")
+    
+    if df_filtered.empty:
+        st.warning("No data available for performance analysis.")
+        return
+    
+    # Performance correlation matrix
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Efficiency analysis (Success Rate vs Cycles)
+        efficiency_data = df_filtered.dropna(subset=['Total Cycles 2022', 'Success Rate Numeric'])
+        if not efficiency_data.empty:
+            fig = px.scatter(
+                efficiency_data,
+                x='Total Cycles 2022',
+                y='Success Rate Numeric',
+                size='Deliveries 2022',
+                color='In service area',
+                hover_data=['Clinic Name', 'City', 'Type'],
+                title='Clinic Efficiency: Success Rate vs Volume',
+                labels={
+                    'Total Cycles 2022': 'Total Cycles',
+                    'Success Rate Numeric': 'Success Rate (%)',
+                    'In service area': 'Service Area'
+                }
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        # Success rate distribution
+        success_data = df_filtered.dropna(subset=['Success Rate Numeric'])
+        if not success_data.empty:
+            fig = px.histogram(
+                success_data,
+                x='Success Rate Numeric',
+                nbins=20,
+                title='Success Rate Distribution',
+                labels={'Success Rate Numeric': 'Success Rate (%)', 'count': 'Number of Clinics'},
+                color_discrete_sequence=['#4facfe']
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Market share analysis
+    col3, col4 = st.columns(2)
+    
+    with col3:
+        # Market share by type
+        type_cycles = df_filtered.groupby('Type')['Total Cycles 2022'].sum().sort_values(ascending=False)
+        if not type_cycles.empty:
+            fig = px.pie(
+                values=type_cycles.values,
+                names=type_cycles.index,
+                title='Market Share by Clinic Type (Total Cycles)',
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with col4:
+        # Geographic distribution
+        city_counts = df_filtered['City'].value_counts().head(10)
+        if not city_counts.empty:
+            fig = px.bar(
+                x=city_counts.values,
+                y=city_counts.index,
+                orientation='h',
+                title='Top 10 Cities by Clinic Count',
+                labels={'x': 'Number of Clinics', 'y': 'City'},
+                color=city_counts.values,
+                color_continuous_scale='viridis'
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Performance rankings
+    st.subheader("🏆 Performance Rankings")
+    
+    # Top performers
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**🥇 Highest Success Rates**")
+        top_success = df_filtered.nlargest(5, 'Success Rate Numeric')[['Clinic Name', 'Success Rate', 'City']]
+        if not top_success.empty:
+            for idx, row in top_success.iterrows():
+                st.markdown(f"• **{row['Clinic Name']}** - {row['Success Rate']} ({row['City']})")
+        else:
+            st.markdown("*No success rate data available*")
+    
+    with col2:
+        st.markdown("**📊 Highest Volume**")
+        top_volume = df_filtered.nlargest(5, 'Total Cycles 2022')[['Clinic Name', 'Total Cycles 2022', 'City']]
+        if not top_volume.empty:
+            for idx, row in top_volume.iterrows():
+                cycles = f"{row['Total Cycles 2022']:,.0f}" if pd.notna(row['Total Cycles 2022']) else "N/A"
+                st.markdown(f"• **{row['Clinic Name']}** - {cycles} cycles ({row['City']})")
+        else:
+            st.markdown("*No volume data available*")
+    
+    with col3:
+        st.markdown("**🎯 Most Deliveries**")
+        top_deliveries = df_filtered.nlargest(5, 'Deliveries 2022')[['Clinic Name', 'Deliveries 2022', 'City']]
+        if not top_deliveries.empty:
+            for idx, row in top_deliveries.iterrows():
+                deliveries = f"{row['Deliveries 2022']:,.0f}" if pd.notna(row['Deliveries 2022']) else "N/A"
+                st.markdown(f"• **{row['Clinic Name']}** - {deliveries} deliveries ({row['City']})")
+        else:
+            st.markdown("*No delivery data available*")
+
+def create_data_explorer(df_filtered: pd.DataFrame) -> None:
+    """Create an interactive data explorer"""
+    
+    st.subheader("📋 Data Explorer")
+    
+    if df_filtered.empty:
+        st.warning("No data available to display.")
+        return
+    
+    # Data overview
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Total Records", len(df_filtered))
+    
+    with col2:
+        missing_coords = df_filtered[['Latitude', 'Longitude']].isna().any(axis=1).sum()
+        st.metric("Missing Coordinates", missing_coords)
+    
+    with col3:
+        complete_data = df_filtered.dropna(subset=['Total Cycles 2022', 'Success Rate Numeric']).shape[0]
+        st.metric("Complete Performance Data", complete_data)
+    
+    # Column selector
+    available_columns = df_filtered.columns.tolist()
+    
+    # Default columns for display
+    default_columns = [
+        'Clinic Name', 'City', 'Type', 'Address', 'Total Cycles 2022',
+        'Pregnancies 2022', 'Deliveries 2022', 'Success Rate', 
+        'In service area', 'In_CDC'
+    ]
+    
+    # Filter default columns to only those that exist
+    default_columns = [col for col in default_columns if col in available_columns]
+    
+    selected_columns = st.multiselect(
+        "Select columns to display:",
+        available_columns,
+        default=default_columns
+    )
+    
+    if selected_columns:
+        # Display data with formatting
+        display_df = df_filtered[selected_columns].copy()
+        
+        # Format numeric columns
+        for col in selected_columns:
+            if col in ['Total Cycles 2022', 'Pregnancies 2022', 'Deliveries 2022']:
+                display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "N/A")
+            elif col == 'Success Rate Numeric':
+                display_df[col] = display_df[col].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
+        
+        # Display with pagination
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            height=500
+        )
+        
+        # Summary statistics
+        st.subheader("📊 Summary Statistics")
+        
+        numeric_cols = df_filtered.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            summary_stats = df_filtered[numeric_cols].describe()
+            st.dataframe(summary_stats, use_container_width=True)
+        
+        # Data quality report
+        st.subheader("🔍 Data Quality Report")
+        
+        quality_report = []
+        for col in selected_columns:
+            missing_count = df_filtered[col].isna().sum()
+            missing_pct = (missing_count / len(df_filtered)) * 100
+            unique_count = df_filtered[col].nunique()
+            
+            quality_report.append({
+                'Column': col,
+                'Missing Count': missing_count,
+                'Missing %': f"{missing_pct:.1f}%",
+                'Unique Values': unique_count,
+                'Data Type': str(df_filtered[col].dtype)
+            })
+        
+        quality_df = pd.DataFrame(quality_report)
+        st.dataframe(quality_df, use_container_width=True)
+    
+    # Export functionality
+    st.subheader("📥 Export Data")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # CSV export
+        csv_data = df_filtered.to_csv(index=False)
+        st.download_button(
+            label="📄 Download as CSV",
+            data=csv_data,
+            file_name=f'fertility_clinics_filtered_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+            mime='text/csv',
+            help="Download the filtered data as a CSV file"
+        )
+    
+    with col2:
+        # JSON export
+        json_data = df_filtered.to_json(orient='records', indent=2)
+        st.download_button(
+            label="📋 Download as JSON",
+            data=json_data,
+            file_name=f'fertility_clinics_filtered_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json',
+            mime='application/json',
+            help="Download the filtered data as a JSON file"
+        )
+
+def main():
+    """Main application entry point"""
+    try:
+        create_streamlit_app()
+    except Exception as e:
+        st.error(f"Application error: {str(e)}")
+        logger.error(f"Application error: {str(e)}")
+        
+        # Show error details in expander for debugging
+        with st.expander("Error Details"):
+            st.code(str(e))
+
+if __name__ == "__main__":
+    main()
